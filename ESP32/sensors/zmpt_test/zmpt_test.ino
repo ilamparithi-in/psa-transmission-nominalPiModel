@@ -1,8 +1,8 @@
-#define ZMPT_PIN 0 // Use GPIO 3 for ESP32-C3, or A0 for Arduino Uno
+#define ZMPT_PIN 2 // Use GPIO 3 for ESP32-C3, or A0 for Arduino Uno
 #define RELAY_PING
 
 void setup() {
-  Serial.begin(921600);
+  Serial.begin(115200);
 }
 
 void loop() {

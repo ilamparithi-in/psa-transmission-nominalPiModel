@@ -38,14 +38,14 @@ struct VoltageSensor {
 // -------------------------------------------------------------
 VoltageSensor sensors[] = {
   // Name, Pin, Sensitivity, Zero-Baseline
-  // VoltageSensor("V1", A3, 26.50f, 2282),
-  VoltageSensor("V2", 0,  23.75f, 2281),
+  VoltageSensor("Vs", 3, 26.50f, 2282),
+  VoltageSensor("Vr", 0, 23.75f, 2281),
 };
 
 const size_t NUM_SENSORS = sizeof(sensors) / sizeof(sensors[0]);
 
 void setup() {
-  Serial.begin(921600);
+  Serial.begin(115200);
 
   for (size_t i = 0; i < NUM_SENSORS; i++) {
     sensors[i].begin();
