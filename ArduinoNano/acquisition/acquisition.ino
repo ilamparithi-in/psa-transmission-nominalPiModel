@@ -25,8 +25,8 @@ bool isFaultLatched = false;
 float freezeVs = 0.0f, freezeVr = 0.0f, freezeIs = 0.0f, freezeIr = 0.0f, freezeIf = 0.0f;
 float freezeVsPk = 0.0f, freezeVrPk = 0.0f, freezeIsPk = 0.0f, freezeIrPk = 0.0f, freezeIfPk = 0.0f;
 
-ezBuzzer buzzer(BUZZER_PIN); // Non-blocking buzzer controller
-
+// Buzzer controller configured for PASSIVE buzzer (uses tone() at 2500 Hz for audible sound)
+ezBuzzer buzzer(BUZZER_PIN, BUZZER_TYPE_PASSIVE);
 // Non-blocking LCD refresh timer
 unsigned long lastLcdUpdate = 0;
 const unsigned long lcdInterval = 250; // Update LCD every 250ms
@@ -248,6 +248,12 @@ void setup() {
     currentSensors[i].begin();
   }
 
+  // Configure buzzer frequency (2500 Hz resonant peak for maximum volume)
+  buzzer.setBeepFrequency(2500);
+
+  // Quick 80ms startup self-test chirp to confirm buzzer operation on boot
+  tone(BUZZER_PIN, 2500, 80);
+
   delay(600);
   lcd.clear();
 }
@@ -260,9 +266,9 @@ void loop() {
   if (isFaultLatched) {
     digitalWrite(RELAY_PIN, LOW); // Hold relay OPEN (Active-Low: LOW = Tripped/Open)
 
-    // Keep buzzer active (siren alarm)
+    // Keep buzzer active (siren alarm: 150ms ON, 80ms OFF)
     if (buzzer.getState() == BUZZER_IDLE) {
-      buzzer.beep(150, 100);
+      buzzer.beep(150, 80);
     }
     buzzer.loop();
 
@@ -310,6 +316,10 @@ void loop() {
     // 1. Immediately trip protection relay open!
     digitalWrite(RELAY_PIN, LOW); // Active-Low: LOW = Open/Tripped
     isFaultLatched = true;
+
+    // Immediately sound audible alarm without delay
+    buzzer.beep(150, 0);
+    buzzer.loop();
 
     // 2. Save frozen snapshot values at fault condition
     freezeVs = vsRms;  freezeVr = vrRms;  freezeIs = isRms;  freezeIr = irRms;  freezeIf = ifRms;
