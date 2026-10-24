@@ -15,12 +15,20 @@
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
 // Relay, Buzzer, Reset & Fault Protection Configuration
-#define RELAY_PIN 2                  // Protection Relay control pin (Active-Low)
+#define RELAY_PIN 2                  // Protection Relay control pin (Active-Low: LOW = Tripped/Open)
 #define BUZZER_PIN 3                 // Audible Alarm Buzzer pin (Active or Passive)
-#define RESET_BTN_PIN 4              // Optional External Reset Button (Active-Low with INPUT_PULLUP)
-#define FAULT_CURRENT_THRESHOLD 6.0f // Overcurrent fault threshold on Sending End (6.0 Amps)
+#define RESET_BTN_PIN 4              // Manual Fault Reset pushbutton (Active-Low with INPUT_PULLUP)
+#define FAULT_CURRENT_THRESHOLD 6.0f // Overcurrent fault threshold on Sending End (6.0 Amps RMS)
 
-bool isFaultLatched = false; // Latching fault lockout state (will not reset until reset button is pressed)
+// 6.0A RMS sine wave corresponds to 8.485A Peak.
+// On 20A ACS712 (100mV/A): 848.5mV. In 10-bit ADC counts (4.887mV/step): ~174 counts deviation.
+const int FAULT_PEAK_DEV_LIMIT = 174;
+
+// Fault State & Frozen Snapshot Variables
+bool isFaultLatched = false;
+float freezeVs = 0.0f, freezeVr = 0.0f, freezeIs = 0.0f, freezeIr = 0.0f, freezeIf = 0.0f;
+float freezeVsPk = 0.0f, freezeVrPk = 0.0f, freezeIsPk = 0.0f, freezeIrPk = 0.0f, freezeIfPk = 0.0f;
+
 ezBuzzer buzzer(BUZZER_PIN); // Non-blocking buzzer controller
 
 // Non-blocking LCD refresh timer
@@ -94,6 +102,11 @@ struct CurrentSensor {
   // Returns RMS current in Amperes (A) with quadrature noise de-embedding
   float getRms(uint8_t loopCount = 1) {
     float rawRms = driver.mA_AC_sampling(50, loopCount) / 1000.0f;
+    if (rawRms >= FAULT_CURRENT_THRESHOLD) {
+      // Sub-cycle trip during RMS integration
+      digitalWrite(RELAY_PIN, LOW); // TRIP RELAY IMMEDIATELY!
+      isFaultLatched = true;
+    }
     if (rawRms <= noiseFloor) {
       return 0.0f;
     }
@@ -101,7 +114,7 @@ struct CurrentSensor {
     return sqrt(rawRms * rawRms - noiseFloor * noiseFloor);
   }
 
-  // Returns Peak current in Amperes (A) with noise threshold
+  // Returns Peak current in Amperes (A) with instantaneous trip check
   float getPeak() {
     int maxDeviation = 0;
     uint32_t tStart = micros();
@@ -111,8 +124,12 @@ struct CurrentSensor {
       if (dev > maxDeviation) {
         maxDeviation = dev;
       }
+      // Instantaneous sub-millisecond hardware trip (<100us)
+      if (pin == A2 && dev >= FAULT_PEAK_DEV_LIMIT) {
+        digitalWrite(RELAY_PIN, LOW); // TRIP RELAY IMMEDIATELY!
+        isFaultLatched = true;
+      }
     }
-    // (5.0V / 1023.0f) / (mVperAmp / 1000.0f) = Amperes
     float peak = ((float)maxDeviation * (5.0f / 1023.0f)) / (mVperAmp / 1000.0f);
     float peakNoiseThreshold = noiseFloor * 1.4142f;
     if (peak <= peakNoiseThreshold) {
@@ -142,11 +159,13 @@ const size_t NUM_VOLTAGE_SENSORS = sizeof(voltageSensors) / sizeof(voltageSensor
 const size_t NUM_CURRENT_SENSORS = sizeof(currentSensors) / sizeof(currentSensors[0]);
 
 // -------------------------------------------------------------
-// LCD Display Update Function (Flicker-Free 16-Char Buffer Overwrite)
-// Row 0: Sending End RMS (e.g. "S: 14.4V  0.45A")
-// Row 1: Receiving End RMS (e.g. "R: 14.2V  0.44A")
+// LCD Display Update Functions (Flicker-Free 16-Char Buffer Overwrite)
 // -------------------------------------------------------------
-void updateLcd(float vsRms, float isRms, float vrRms, float irRms, bool isFault) {
+
+// Normal operation:
+// Row 0: S: 13.5V  0.57A
+// Row 1: R: 13.1V  0.47A
+void updateLcdNormal(float vsRms, float isRms, float vrRms, float irRms) {
   char vBuf[7];
   char iBuf[7];
   char line[17];
@@ -158,20 +177,46 @@ void updateLcd(float vsRms, float isRms, float vrRms, float irRms, bool isFault)
   lcd.setCursor(0, 0);
   lcd.print(line);
 
-  // Row 1: Receiving End RMS (or LATCHED Fault Alert requiring reset)
-  if (isFault) {
-    lcd.setCursor(0, 1);
-    lcd.print(F("!TRIP! PRESS RST"));
-  } else {
-    dtostrf(vrRms, 4, 1, vBuf);
-    dtostrf(irRms, 4, 2, iBuf);
-    snprintf(line, sizeof(line), "R:%5sV %5sA", vBuf, iBuf);
-    lcd.setCursor(0, 1);
-    lcd.print(line);
-  }
+  // Row 1: Receiving End RMS
+  dtostrf(vrRms, 4, 1, vBuf);
+  dtostrf(irRms, 4, 2, iBuf);
+  snprintf(line, sizeof(line), "R:%5sV %5sA", vBuf, iBuf);
+  lcd.setCursor(0, 1);
+  lcd.print(line);
 
 #if defined(WIRE_HAS_TIMEOUT)
-  // If an EMI glitch caused an I2C timeout, clear flag and recover LCD
+  if (Wire.getWireTimeoutFlag()) {
+    Wire.clearWireTimeoutFlag();
+    lcd.init();
+    lcd.backlight();
+  }
+#endif
+}
+
+// Frozen fault condition display:
+// Row 0: Vs: 7.09  Vr: 1.03
+// Row 1: Is: 8.29  Ir: 0.00
+void updateLcdFrozenFault(float vs, float vr, float is, float ir) {
+  char vsBuf[7], vrBuf[7], isBuf[7], irBuf[7];
+  char line0[17], line1[17];
+
+  dtostrf(vs, 4, (vs >= 10.0f) ? 1 : 2, vsBuf);
+  dtostrf(vr, 4, (vr >= 10.0f) ? 1 : 2, vrBuf);
+  dtostrf(is, 4, (is >= 10.0f) ? 1 : 2, isBuf);
+  dtostrf(ir, 4, (ir >= 10.0f) ? 1 : 2, irBuf);
+
+  snprintf(line0, sizeof(line0), "Vs:%-4s  Vr:%-4s", vsBuf, vrBuf);
+  snprintf(line1, sizeof(line1), "Is:%-4s  Ir:%-4s", isBuf, irBuf);
+
+  line0[16] = '\0';
+  line1[16] = '\0';
+
+  lcd.setCursor(0, 0);
+  lcd.print(line0);
+  lcd.setCursor(0, 1);
+  lcd.print(line1);
+
+#if defined(WIRE_HAS_TIMEOUT)
   if (Wire.getWireTimeoutFlag()) {
     Wire.clearWireTimeoutFlag();
     lcd.init();
@@ -222,16 +267,62 @@ void setup() {
 }
 
 void loop() {
-  // 1. Acquire Voltage readings
+  // -------------------------------------------------------------
+  // 1. If currently in Latched Fault Mode:
+  // Hold relay OPEN, hold buzzer active, freeze LCD and Serial!
+  // -------------------------------------------------------------
+  if (isFaultLatched) {
+    digitalWrite(RELAY_PIN, LOW); // Hold relay OPEN (Active-Low: LOW = Tripped/Open)
+
+    // Keep buzzer active (siren alarm)
+    if (buzzer.getState() == BUZZER_IDLE) {
+      buzzer.beep(150, 100);
+    }
+    buzzer.loop();
+
+    // Check Reset Button (Pin D4 or onboard RST button)
+    if (digitalRead(RESET_BTN_PIN) == LOW) {
+      delay(50); // Debounce
+      if (digitalRead(RESET_BTN_PIN) == LOW) {
+        isFaultLatched = false;
+        buzzer.stop();
+        digitalWrite(RELAY_PIN, HIGH); // Re-close relay
+        Serial.println(F("\n>>> FAULT CLEARED VIA RESET BUTTON. RESUMING NORMAL OPERATION <<<\n"));
+        lcd.clear();
+      }
+    }
+
+    // FREEZE: Do NOT perform any sensor sampling or overwrite frozen values!
+    delay(10);
+    return;
+  }
+
+  // -------------------------------------------------------------
+  // 2. Normal Mode: Instantaneous Overcurrent Check & Sensor Sampling
+  // -------------------------------------------------------------
+
+  // Immediate instantaneous peak check (<100 microseconds)
+  int instantDev = abs(analogRead(A2) - 512);
+  if (instantDev >= FAULT_PEAK_DEV_LIMIT) {
+    digitalWrite(RELAY_PIN, LOW); // TRIP RELAY IMMEDIATELY!
+    isFaultLatched = true;
+  }
+
+  // Sample Sending End Current FIRST for minimal detection delay
+  float isRms = currentSensors[0].getRms();
+  float isPeak = currentSensors[0].getPeak();
+
+  if (isRms >= FAULT_CURRENT_THRESHOLD || isPeak >= (FAULT_CURRENT_THRESHOLD * 1.4142f)) {
+    digitalWrite(RELAY_PIN, LOW); // TRIP RELAY IMMEDIATELY!
+    isFaultLatched = true;
+  }
+
+  // Acquire remaining sensor values
   float vsRms = voltageSensors[0].getRms();
   float vsPeak = voltageSensors[0].getPeak();
 
   float vrRms = (NUM_VOLTAGE_SENSORS > 1) ? voltageSensors[1].getRms() : 0.0f;
   float vrPeak = (NUM_VOLTAGE_SENSORS > 1) ? voltageSensors[1].getPeak() : 0.0f;
-
-  // 2. Acquire Current readings
-  float isRms = currentSensors[0].getRms();
-  float isPeak = currentSensors[0].getPeak();
 
   float irRms = (NUM_CURRENT_SENSORS > 1) ? currentSensors[1].getRms() : 0.0f;
   float irPeak = (NUM_CURRENT_SENSORS > 1) ? currentSensors[1].getPeak() : 0.0f;
@@ -239,35 +330,36 @@ void loop() {
   float ifRms = (NUM_CURRENT_SENSORS > 2) ? currentSensors[2].getRms() : 0.0f;
   float ifPeak = (NUM_CURRENT_SENSORS > 2) ? currentSensors[2].getPeak() : 0.0f;
 
-  // Check external Reset Button (Pin D4) to clear latched fault
-  if (isFaultLatched && digitalRead(RESET_BTN_PIN) == LOW) {
-    delay(50); // Debounce
-    if (digitalRead(RESET_BTN_PIN) == LOW) {
-      isFaultLatched = false;
-      buzzer.stop();
-      digitalWrite(RELAY_PIN, HIGH); // Re-close relay
-      Serial.println(F("Fault cleared via Reset Button."));
-    }
-  }
-
-  // 3. Fault Detection & Latching Protection (Sending-End Current > 6A)
-  if (isRms >= FAULT_CURRENT_THRESHOLD) {
-    isFaultLatched = true; // Lock into latched fault state
-  }
-
-  // When latched in fault: relay stays pulled open, buzzer stays active
+  // -------------------------------------------------------------
+  // 3. Handle State Transition: Normal vs. Fault Latch
+  // -------------------------------------------------------------
   if (isFaultLatched) {
-    digitalWrite(RELAY_PIN, LOW); // Pull relay open (Active-Low: LOW = Tripped/Open)
-    if (buzzer.getState() == BUZZER_IDLE) {
-      buzzer.beep(150, 100); // Continuous non-blocking alarm siren
-    }
-  } else {
-    digitalWrite(RELAY_PIN, HIGH); // Normal closed / un-tripped (Active-Low)
-    buzzer.stop(); // Silence buzzer
-  }
-  buzzer.loop(); // Non-blocking state update
+    // Save frozen snapshot
+    freezeVs = vsRms;  freezeVr = vrRms;  freezeIs = isRms;  freezeIr = irRms;  freezeIf = ifRms;
+    freezeVsPk = vsPeak; freezeVrPk = vrPeak; freezeIsPk = isPeak; freezeIrPk = irPeak; freezeIfPk = ifPeak;
 
-  // 4. Print labeled Serial stream (for Serial Plotter / Data Logging)
+    // Print the EXACT single frozen serial line (Fault:1)
+    Serial.print(F("Vs_RMS:"));  Serial.print(freezeVs, 2);   Serial.print(F(" "));
+    Serial.print(F("Vs_Peak:")); Serial.print(freezeVsPk, 2); Serial.print(F(" "));
+    Serial.print(F("Vr_RMS:"));  Serial.print(freezeVr, 2);   Serial.print(F(" "));
+    Serial.print(F("Vr_Peak:")); Serial.print(freezeVrPk, 2); Serial.print(F(" "));
+    Serial.print(F("Is_RMS:"));  Serial.print(freezeIs, 3);   Serial.print(F(" "));
+    Serial.print(F("Is_Peak:")); Serial.print(freezeIsPk, 3); Serial.print(F(" "));
+    Serial.print(F("Ir_RMS:"));  Serial.print(freezeIr, 3);   Serial.print(F(" "));
+    Serial.print(F("Ir_Peak:")); Serial.print(freezeIrPk, 3); Serial.print(F(" "));
+    Serial.print(F("If_RMS:"));  Serial.print(freezeIf, 3);   Serial.print(F(" "));
+    Serial.print(F("If_Peak:")); Serial.print(freezeIfPk, 3); Serial.print(F(" "));
+    Serial.print(F("Fault:1"));
+    Serial.println();
+
+    // Freeze LCD immediately displaying Vs, Vr, Is, Ir
+    updateLcdFrozenFault(freezeVs, freezeVr, freezeIs, freezeIr);
+    return;
+  }
+
+  // -------------------------------------------------------------
+  // 4. Normal Streaming & LCD Update
+  // -------------------------------------------------------------
   Serial.print(F("Vs_RMS:"));  Serial.print(vsRms, 2);  Serial.print(F(" "));
   Serial.print(F("Vs_Peak:")); Serial.print(vsPeak, 2); Serial.print(F(" "));
   Serial.print(F("Vr_RMS:"));  Serial.print(vrRms, 2);  Serial.print(F(" "));
@@ -278,15 +370,12 @@ void loop() {
   Serial.print(F("Ir_Peak:")); Serial.print(irPeak, 3); Serial.print(F(" "));
   Serial.print(F("If_RMS:"));  Serial.print(ifRms, 3);  Serial.print(F(" "));
   Serial.print(F("If_Peak:")); Serial.print(ifPeak, 3); Serial.print(F(" "));
-  Serial.print(F("Fault:"));   Serial.print(isFaultLatched ? 1 : 0);
+  Serial.print(F("Fault:0"));
   Serial.println();
 
-  // 5. Update 16x2 LCD Display (non-blocking, flicker-free)
   unsigned long now = millis();
   if (now - lastLcdUpdate >= lcdInterval) {
     lastLcdUpdate = now;
-    updateLcd(vsRms, isRms, vrRms, irRms, isFaultLatched);
+    updateLcdNormal(vsRms, isRms, vrRms, irRms);
   }
-
-  delay(50);
 }
