@@ -13,6 +13,10 @@
 
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
+// Relay & Fault Protection Configuration
+#define RELAY_PIN 2                  // Protection Relay control pin (Active-Low)
+#define FAULT_CURRENT_THRESHOLD 6.0f // Overcurrent fault threshold on Sending End (6.0 Amps)
+
 // Non-blocking LCD refresh timer
 unsigned long lastLcdUpdate = 0;
 const unsigned long lcdInterval = 250; // Update LCD every 250ms
@@ -62,15 +66,17 @@ struct CurrentSensor {
   uint8_t pin;
   float mVperAmp;
   int zeroBaseline;
+  float noiseFloor; // Quiescent RMS noise floor in Amperes (default 0.17A)
   ACS712 driver;
 
   // Arduino Nano: 10-bit ADC (0-1023), 5.0V reference, zero baseline ~512
   // ACS712 models: 5A = 185.0 mV/A, 20A = 100.0 mV/A, 30A = 66.0 mV/A
-  // Pass zero = 0 to trigger automatic midpoint calibration on boot
-  CurrentSensor(const char* n, uint8_t p, float mVperA = 100.0f, int zero = 512)
-    : name(n), pin(p), mVperAmp(mVperA), zeroBaseline(zero), driver(p, 5.0, 1023, mVperA) {}
+  // noiseFloor: compensates for inherent Hall sensor & ADC thermal noise floor at 0A
+  CurrentSensor(const char* n, uint8_t p, float mVperA = 100.0f, int zero = 512, float noise = 0.17f)
+    : name(n), pin(p), mVperAmp(mVperA), zeroBaseline(zero), noiseFloor(noise), driver(p, 5.0, 1023, mVperA) {}
 
   void begin() {
+    driver.suppressNoise(true); // Smooth high-frequency ADC noise
     if (zeroBaseline > 0) {
       driver.setMidPoint(zeroBaseline);
     } else {
@@ -79,12 +85,17 @@ struct CurrentSensor {
     }
   }
 
-  // Returns RMS current in Amperes (A)
+  // Returns RMS current in Amperes (A) with quadrature noise de-embedding
   float getRms(uint8_t loopCount = 1) {
-    return driver.mA_AC_sampling(50, loopCount) / 1000.0f;
+    float rawRms = driver.mA_AC_sampling(50, loopCount) / 1000.0f;
+    if (rawRms <= noiseFloor) {
+      return 0.0f;
+    }
+    // Quadrature de-embedding: I_true^2 = I_meas^2 - I_noise^2
+    return sqrt(rawRms * rawRms - noiseFloor * noiseFloor);
   }
 
-  // Returns Peak current in Amperes (A)
+  // Returns Peak current in Amperes (A) with noise threshold
   float getPeak() {
     int maxDeviation = 0;
     uint32_t tStart = micros();
@@ -96,7 +107,12 @@ struct CurrentSensor {
       }
     }
     // (5.0V / 1023.0f) / (mVperAmp / 1000.0f) = Amperes
-    return ((float)maxDeviation * (5.0f / 1023.0f)) / (mVperAmp / 1000.0f);
+    float peak = ((float)maxDeviation * (5.0f / 1023.0f)) / (mVperAmp / 1000.0f);
+    float peakNoiseThreshold = noiseFloor * 1.4142f;
+    if (peak <= peakNoiseThreshold) {
+      return 0.0f;
+    }
+    return peak;
   }
 };
 
@@ -110,10 +126,10 @@ VoltageSensor voltageSensors[] = {
 };
 
 CurrentSensor currentSensors[] = {
-  // Name, Pin, mVperAmp, Zero-Baseline
-  CurrentSensor("Is", A2, 100.0f, 512), // Sending-end Current (20A module: 100 mV/A)
-  CurrentSensor("Ir", A3, 100.0f, 512), // Receiving-end Current
-  CurrentSensor("If", A6, 100.0f, 512), // Fault Bridge Current
+  // Name, Pin, mVperAmp, Zero-Baseline, Noise-Floor (A)
+  CurrentSensor("Is", A2, 100.0f, 512, 0.17f), // Sending-end Current (20A module: 100 mV/A)
+  CurrentSensor("Ir", A3, 100.0f, 512, 0.17f), // Receiving-end Current
+  CurrentSensor("If", A6, 100.0f, 512, 0.17f), // Fault Bridge Current
 };
 
 const size_t NUM_VOLTAGE_SENSORS = sizeof(voltageSensors) / sizeof(voltageSensors[0]);
@@ -124,7 +140,7 @@ const size_t NUM_CURRENT_SENSORS = sizeof(currentSensors) / sizeof(currentSensor
 // Row 0: Sending End RMS (e.g. "S: 14.4V  0.45A")
 // Row 1: Receiving End RMS (e.g. "R: 14.2V  0.44A")
 // -------------------------------------------------------------
-void updateLcd(float vsRms, float isRms, float vrRms, float irRms, float ifRms) {
+void updateLcd(float vsRms, float isRms, float vrRms, float irRms, bool isFault) {
   char vBuf[7];
   char iBuf[7];
   char line[17];
@@ -136,11 +152,10 @@ void updateLcd(float vsRms, float isRms, float vrRms, float irRms, float ifRms) 
   lcd.setCursor(0, 0);
   lcd.print(line);
 
-  // Row 1: Receiving End RMS (or Fault Alert if fault current detected)
-  if (ifRms > 0.05f) {
+  // Row 1: Receiving End RMS (or Fault Alert if Sending-End Current > 6A)
+  if (isFault) {
     dtostrf(vrRms, 4, 1, vBuf);
-    dtostrf(ifRms, 4, 2, iBuf);
-    snprintf(line, sizeof(line), "R:%4sV !FLT:%4s", vBuf, iBuf);
+    snprintf(line, sizeof(line), "R:%5sV !FAULT!", vBuf);
   } else {
     dtostrf(vrRms, 4, 1, vBuf);
     dtostrf(irRms, 4, 2, iBuf);
@@ -155,6 +170,10 @@ void updateLcd(float vsRms, float isRms, float vrRms, float irRms, float ifRms) 
 // -------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+
+  // Initialize Protection Relay
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // Normal closed / un-tripped (Active-Low)
 
   // Initialize LCD display
   lcd.init();
@@ -196,7 +215,11 @@ void loop() {
   float ifRms = (NUM_CURRENT_SENSORS > 2) ? currentSensors[2].getRms() : 0.0f;
   float ifPeak = (NUM_CURRENT_SENSORS > 2) ? currentSensors[2].getPeak() : 0.0f;
 
-  // 3. Print labeled Serial stream (for Serial Plotter / Data Logging)
+  // 3. Fault Detection & Protection (Fault condition if Sending-End Current > 6A)
+  bool isFault = (isRms >= FAULT_CURRENT_THRESHOLD);
+  digitalWrite(RELAY_PIN, isFault ? LOW : HIGH); // Trip relay on fault (Active-Low: LOW = Trip)
+
+  // 4. Print labeled Serial stream (for Serial Plotter / Data Logging)
   Serial.print(F("Vs_RMS:"));  Serial.print(vsRms, 2);  Serial.print(F(" "));
   Serial.print(F("Vs_Peak:")); Serial.print(vsPeak, 2); Serial.print(F(" "));
   Serial.print(F("Vr_RMS:"));  Serial.print(vrRms, 2);  Serial.print(F(" "));
@@ -206,14 +229,15 @@ void loop() {
   Serial.print(F("Ir_RMS:"));  Serial.print(irRms, 3);  Serial.print(F(" "));
   Serial.print(F("Ir_Peak:")); Serial.print(irPeak, 3); Serial.print(F(" "));
   Serial.print(F("If_RMS:"));  Serial.print(ifRms, 3);  Serial.print(F(" "));
-  Serial.print(F("If_Peak:")); Serial.print(ifPeak, 3);
+  Serial.print(F("If_Peak:")); Serial.print(ifPeak, 3); Serial.print(F(" "));
+  Serial.print(F("Fault:"));   Serial.print(isFault ? 1 : 0);
   Serial.println();
 
-  // 4. Update 16x2 LCD Display (non-blocking, flicker-free)
+  // 5. Update 16x2 LCD Display (non-blocking, flicker-free)
   unsigned long now = millis();
   if (now - lastLcdUpdate >= lcdInterval) {
     lastLcdUpdate = now;
-    updateLcd(vsRms, isRms, vrRms, irRms, ifRms);
+    updateLcd(vsRms, isRms, vrRms, irRms, isFault);
   }
 
   delay(50);
