@@ -27,8 +27,9 @@ float freezeVsPk = 0.0f, freezeVrPk = 0.0f, freezeIsPk = 0.0f, freezeIrPk = 0.0f
 
 // Buzzer controller configured for PASSIVE buzzer (uses tone() at 2500 Hz for audible sound)
 ezBuzzer buzzer(BUZZER_PIN, BUZZER_TYPE_PASSIVE);
-// Non-blocking LCD refresh timer
+// Non-blocking LCD refresh timers
 unsigned long lastLcdUpdate = 0;
+unsigned long lastFrozenLcdUpdate = 0;
 const unsigned long lcdInterval = 250; // Update LCD every 250ms
 
 // -------------------------------------------------------------
@@ -170,13 +171,13 @@ void updateLcdNormal(float vsRms, float isRms, float vrRms, float irRms) {
   lcd.setCursor(0, 1);
   lcd.print(line);
 
-#if defined(WIRE_HAS_TIMEOUT)
   if (Wire.getWireTimeoutFlag()) {
     Wire.clearWireTimeoutFlag();
+    Wire.begin();
+    Wire.setWireTimeout(3000, true);
     lcd.init();
     lcd.backlight();
   }
-#endif
 }
 
 // Frozen fault condition display:
@@ -186,10 +187,10 @@ void updateLcdFrozenFault(float vs, float vr, float is, float ir) {
   char vsBuf[7], vrBuf[7], isBuf[7], irBuf[7];
   char line0[17], line1[17];
 
-  dtostrf(vs, (vs >= 10.0f) ? 4 : 4, (vs >= 10.0f) ? 1 : 2, vsBuf);
-  dtostrf(vr, (vr >= 10.0f) ? 4 : 4, (vr >= 10.0f) ? 1 : 2, vrBuf);
-  dtostrf(is, (is >= 10.0f) ? 4 : 4, (is >= 10.0f) ? 1 : 2, isBuf);
-  dtostrf(ir, (ir >= 10.0f) ? 4 : 4, (ir >= 10.0f) ? 1 : 2, irBuf);
+  dtostrf(vs, 4, (vs >= 10.0f) ? 1 : 2, vsBuf);
+  dtostrf(vr, 4, (vr >= 10.0f) ? 1 : 2, vrBuf);
+  dtostrf(is, 4, (is >= 10.0f) ? 1 : 2, isBuf);
+  dtostrf(ir, 4, (ir >= 10.0f) ? 1 : 2, irBuf);
 
   snprintf(line0, sizeof(line0), "Vs:%-4s  Vr:%-4s", vsBuf, vrBuf);
   snprintf(line1, sizeof(line1), "Is:%-4s  Ir:%-4s", isBuf, irBuf);
@@ -202,13 +203,13 @@ void updateLcdFrozenFault(float vs, float vr, float is, float ir) {
   lcd.setCursor(0, 1);
   lcd.print(line1);
 
-#if defined(WIRE_HAS_TIMEOUT)
   if (Wire.getWireTimeoutFlag()) {
     Wire.clearWireTimeoutFlag();
+    Wire.begin();
+    Wire.setWireTimeout(3000, true);
     lcd.init();
     lcd.backlight();
   }
-#endif
 }
 
 // -------------------------------------------------------------
@@ -219,9 +220,7 @@ void setup() {
 
   // Initialize I2C with hardware bus timeout to prevent lockup on switching transients/EMI
   Wire.begin();
-#if defined(WIRE_HAS_TIMEOUT)
-  Wire.setWireTimeout(25000, true); // 25ms timeout, auto-reset hardware TWI on timeout
-#endif
+  Wire.setWireTimeout(3000, true); // 3ms timeout, auto-reset hardware TWI on timeout
 
   // Initialize Protection Relay
   pinMode(RELAY_PIN, OUTPUT);
@@ -284,8 +283,14 @@ void loop() {
       }
     }
 
-    // FREEZE: Do NOT perform any sensor sampling or overwrite frozen values!
-    delay(10);
+    // Refresh frozen display periodically (every 250ms) to ensure continuous recovery from any EMI transients
+    unsigned long now = millis();
+    if (now - lastFrozenLcdUpdate >= 250) {
+      lastFrozenLcdUpdate = now;
+      updateLcdFrozenFault(freezeVs, freezeVr, freezeIs, freezeIr);
+    }
+
+    delay(5);
     return;
   }
 
