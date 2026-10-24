@@ -17,12 +17,8 @@ LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 // Relay, Buzzer, Reset & Fault Protection Configuration
 #define RELAY_PIN 2                  // Protection Relay control pin (Active-Low: LOW = Tripped/Open)
 #define BUZZER_PIN 3                 // Audible Alarm Buzzer pin (Active or Passive)
-#define RESET_BTN_PIN 4              // Manual Fault Reset pushbutton (Active-Low with INPUT_PULLUP)
+#define RESET_BTN_PIN 4              // Optional External Reset pushbutton (Active-Low with INPUT_PULLUP)
 #define FAULT_CURRENT_THRESHOLD 6.0f // Overcurrent fault threshold on Sending End (6.0 Amps RMS)
-
-// 6.0A RMS sine wave corresponds to 8.485A Peak.
-// On 20A ACS712 (100mV/A): 848.5mV. In 10-bit ADC counts (4.887mV/step): ~174 counts deviation.
-const int FAULT_PEAK_DEV_LIMIT = 174;
 
 // Fault State & Frozen Snapshot Variables
 bool isFaultLatched = false;
@@ -102,11 +98,6 @@ struct CurrentSensor {
   // Returns RMS current in Amperes (A) with quadrature noise de-embedding
   float getRms(uint8_t loopCount = 1) {
     float rawRms = driver.mA_AC_sampling(50, loopCount) / 1000.0f;
-    if (rawRms >= FAULT_CURRENT_THRESHOLD) {
-      // Sub-cycle trip during RMS integration
-      digitalWrite(RELAY_PIN, LOW); // TRIP RELAY IMMEDIATELY!
-      isFaultLatched = true;
-    }
     if (rawRms <= noiseFloor) {
       return 0.0f;
     }
@@ -114,7 +105,7 @@ struct CurrentSensor {
     return sqrt(rawRms * rawRms - noiseFloor * noiseFloor);
   }
 
-  // Returns Peak current in Amperes (A) with instantaneous trip check
+  // Returns Peak current in Amperes (A)
   float getPeak() {
     int maxDeviation = 0;
     uint32_t tStart = micros();
@@ -123,11 +114,6 @@ struct CurrentSensor {
       int dev = abs(raw - zeroBaseline);
       if (dev > maxDeviation) {
         maxDeviation = dev;
-      }
-      // Instantaneous sub-millisecond hardware trip (<100us)
-      if (pin == A2 && dev >= FAULT_PEAK_DEV_LIMIT) {
-        digitalWrite(RELAY_PIN, LOW); // TRIP RELAY IMMEDIATELY!
-        isFaultLatched = true;
       }
     }
     float peak = ((float)maxDeviation * (5.0f / 1023.0f)) / (mVperAmp / 1000.0f);
@@ -200,10 +186,10 @@ void updateLcdFrozenFault(float vs, float vr, float is, float ir) {
   char vsBuf[7], vrBuf[7], isBuf[7], irBuf[7];
   char line0[17], line1[17];
 
-  dtostrf(vs, 4, (vs >= 10.0f) ? 1 : 2, vsBuf);
-  dtostrf(vr, 4, (vr >= 10.0f) ? 1 : 2, vrBuf);
-  dtostrf(is, 4, (is >= 10.0f) ? 1 : 2, isBuf);
-  dtostrf(ir, 4, (ir >= 10.0f) ? 1 : 2, irBuf);
+  dtostrf(vs, (vs >= 10.0f) ? 4 : 4, (vs >= 10.0f) ? 1 : 2, vsBuf);
+  dtostrf(vr, (vr >= 10.0f) ? 4 : 4, (vr >= 10.0f) ? 1 : 2, vrBuf);
+  dtostrf(is, (is >= 10.0f) ? 4 : 4, (is >= 10.0f) ? 1 : 2, isBuf);
+  dtostrf(ir, (ir >= 10.0f) ? 4 : 4, (ir >= 10.0f) ? 1 : 2, irBuf);
 
   snprintf(line0, sizeof(line0), "Vs:%-4s  Vr:%-4s", vsBuf, vrBuf);
   snprintf(line1, sizeof(line1), "Is:%-4s  Ir:%-4s", isBuf, irBuf);
@@ -298,24 +284,11 @@ void loop() {
   }
 
   // -------------------------------------------------------------
-  // 2. Normal Mode: Instantaneous Overcurrent Check & Sensor Sampling
+  // 2. Normal Mode: Acquire Sensors
+  // Sample Sending End Current FIRST for minimal detection delay (20ms)
   // -------------------------------------------------------------
-
-  // Immediate instantaneous peak check (<100 microseconds)
-  int instantDev = abs(analogRead(A2) - 512);
-  if (instantDev >= FAULT_PEAK_DEV_LIMIT) {
-    digitalWrite(RELAY_PIN, LOW); // TRIP RELAY IMMEDIATELY!
-    isFaultLatched = true;
-  }
-
-  // Sample Sending End Current FIRST for minimal detection delay
   float isRms = currentSensors[0].getRms();
   float isPeak = currentSensors[0].getPeak();
-
-  if (isRms >= FAULT_CURRENT_THRESHOLD || isPeak >= (FAULT_CURRENT_THRESHOLD * 1.4142f)) {
-    digitalWrite(RELAY_PIN, LOW); // TRIP RELAY IMMEDIATELY!
-    isFaultLatched = true;
-  }
 
   // Acquire remaining sensor values
   float vsRms = voltageSensors[0].getRms();
@@ -331,14 +304,18 @@ void loop() {
   float ifPeak = (NUM_CURRENT_SENSORS > 2) ? currentSensors[2].getPeak() : 0.0f;
 
   // -------------------------------------------------------------
-  // 3. Handle State Transition: Normal vs. Fault Latch
+  // 3. Fault Detection (Sending-End Current >= 6.0A RMS)
   // -------------------------------------------------------------
-  if (isFaultLatched) {
-    // Save frozen snapshot
+  if (isRms >= FAULT_CURRENT_THRESHOLD) {
+    // 1. Immediately trip protection relay open!
+    digitalWrite(RELAY_PIN, LOW); // Active-Low: LOW = Open/Tripped
+    isFaultLatched = true;
+
+    // 2. Save frozen snapshot values at fault condition
     freezeVs = vsRms;  freezeVr = vrRms;  freezeIs = isRms;  freezeIr = irRms;  freezeIf = ifRms;
     freezeVsPk = vsPeak; freezeVrPk = vrPeak; freezeIsPk = isPeak; freezeIrPk = irPeak; freezeIfPk = ifPeak;
 
-    // Print the EXACT single frozen serial line (Fault:1)
+    // 3. Print the EXACT single frozen serial line (Fault:1)
     Serial.print(F("Vs_RMS:"));  Serial.print(freezeVs, 2);   Serial.print(F(" "));
     Serial.print(F("Vs_Peak:")); Serial.print(freezeVsPk, 2); Serial.print(F(" "));
     Serial.print(F("Vr_RMS:"));  Serial.print(freezeVr, 2);   Serial.print(F(" "));
@@ -352,7 +329,7 @@ void loop() {
     Serial.print(F("Fault:1"));
     Serial.println();
 
-    // Freeze LCD immediately displaying Vs, Vr, Is, Ir
+    // 4. Freeze LCD immediately displaying Vs, Vr, Is, Ir
     updateLcdFrozenFault(freezeVs, freezeVr, freezeIs, freezeIr);
     return;
   }
