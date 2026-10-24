@@ -121,8 +121,8 @@ struct CurrentSensor {
 // -------------------------------------------------------------
 VoltageSensor voltageSensors[] = {
   // Name, Pin, Sensitivity, Zero-Baseline
-  VoltageSensor("Vs", A0, 26.50f, 514), // Sending-end Voltage
-  VoltageSensor("Vr", A1, 23.75f, 514), // Receiving-end Voltage
+  VoltageSensor("Vs", A0, 17.00f, 514), // Sending-end Voltage (calibrated for 13.5V)
+  VoltageSensor("Vr", A1, 15.56f, 514), // Receiving-end Voltage (calibrated for 13.1V)
 };
 
 CurrentSensor currentSensors[] = {
@@ -163,6 +163,15 @@ void updateLcd(float vsRms, float isRms, float vrRms, float irRms, bool isFault)
   }
   lcd.setCursor(0, 1);
   lcd.print(line);
+
+#if defined(WIRE_HAS_TIMEOUT)
+  // If an EMI glitch caused an I2C timeout, clear flag and recover LCD
+  if (Wire.getWireTimeoutFlag()) {
+    Wire.clearWireTimeoutFlag();
+    lcd.init();
+    lcd.backlight();
+  }
+#endif
 }
 
 // -------------------------------------------------------------
@@ -170,6 +179,12 @@ void updateLcd(float vsRms, float isRms, float vrRms, float irRms, bool isFault)
 // -------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+
+  // Initialize I2C with hardware bus timeout to prevent lockup on switching transients/EMI
+  Wire.begin();
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(25000, true); // 25ms timeout, auto-reset hardware TWI on timeout
+#endif
 
   // Initialize Protection Relay
   pinMode(RELAY_PIN, OUTPUT);
