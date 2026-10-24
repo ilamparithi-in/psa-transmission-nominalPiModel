@@ -2,6 +2,7 @@
 #include <LiquidCrystal_I2C.h>
 #include <ZMPT101B.h>
 #include <ACS712.h>
+#include <ezBuzzer.h>
 
 // -------------------------------------------------------------
 // 16x2 LCD Display Configuration (I2C Backpack PCF8574)
@@ -13,9 +14,12 @@
 
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
-// Relay & Fault Protection Configuration
+// Relay, Buzzer & Fault Protection Configuration
 #define RELAY_PIN 2                  // Protection Relay control pin (Active-Low)
+#define BUZZER_PIN 3                 // Audible Alarm Buzzer pin (Active or Passive)
 #define FAULT_CURRENT_THRESHOLD 6.0f // Overcurrent fault threshold on Sending End (6.0 Amps)
+
+ezBuzzer buzzer(BUZZER_PIN); // Non-blocking buzzer controller
 
 // Non-blocking LCD refresh timer
 unsigned long lastLcdUpdate = 0;
@@ -234,7 +238,17 @@ void loop() {
   bool isFault = (isRms >= FAULT_CURRENT_THRESHOLD);
   digitalWrite(RELAY_PIN, isFault ? LOW : HIGH); // Trip relay on fault (Active-Low: LOW = Trip)
 
-  // 4. Print labeled Serial stream (for Serial Plotter / Data Logging)
+  // 4. Buzzer Alarm Control (Non-blocking pulsing alarm during fault)
+  if (isFault) {
+    if (buzzer.getState() == BUZZER_IDLE) {
+      buzzer.beep(150, 100); // 150ms ON, 100ms OFF siren
+    }
+  } else {
+    buzzer.stop(); // Silence immediately when fault clears
+  }
+  buzzer.loop(); // Non-blocking state update
+
+  // 5. Print labeled Serial stream (for Serial Plotter / Data Logging)
   Serial.print(F("Vs_RMS:"));  Serial.print(vsRms, 2);  Serial.print(F(" "));
   Serial.print(F("Vs_Peak:")); Serial.print(vsPeak, 2); Serial.print(F(" "));
   Serial.print(F("Vr_RMS:"));  Serial.print(vrRms, 2);  Serial.print(F(" "));
@@ -248,7 +262,7 @@ void loop() {
   Serial.print(F("Fault:"));   Serial.print(isFault ? 1 : 0);
   Serial.println();
 
-  // 5. Update 16x2 LCD Display (non-blocking, flicker-free)
+  // 6. Update 16x2 LCD Display (non-blocking, flicker-free)
   unsigned long now = millis();
   if (now - lastLcdUpdate >= lcdInterval) {
     lastLcdUpdate = now;
