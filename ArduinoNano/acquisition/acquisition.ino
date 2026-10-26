@@ -14,14 +14,23 @@
 
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 
-// Relay, Buzzer, Reset & Fault Protection Configuration
+// Relay, Buzzer, Button & Fault Protection Configuration
 #define RELAY_PIN 2                  // Protection Relay control pin (Active-Low: LOW = Tripped/Open)
 #define BUZZER_PIN 3                 // Audible Alarm Buzzer pin (Active or Passive)
-#define RESET_BTN_PIN 4              // Optional External Reset pushbutton (Active-Low with INPUT_PULLUP)
+#define BTN_PIN 4                    // Tactile pushbutton to toggle Serial Plotter / RMS mode (Active-Low: pulls to GND)
 #define FAULT_CURRENT_THRESHOLD 6.0f // Overcurrent fault threshold on Sending End (6.0 Amps RMS)
 
-// Fault State & Frozen Snapshot Variables
+// Serial Output Mode & Button State
+bool isPlotterMode = false;          // false = Periodic RMS reporting, true = Serial Plotter (ADC counts)
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+// Fault State, Clearing Time & Frozen Snapshot Variables
 bool isFaultLatched = false;
+unsigned long faultLatchTime = 0;    // Millisecond timestamp when fault was latched
+float tripTimeMs = 0.0f;             // Supply disconnection time in milliseconds
+float tripCycles = 0.0f;             // Disconnection time in 50Hz cycles
 float freezeVs = 0.0f, freezeVr = 0.0f, freezeIs = 0.0f, freezeIr = 0.0f, freezeIf = 0.0f;
 float freezeVsPk = 0.0f, freezeVrPk = 0.0f, freezeIsPk = 0.0f, freezeIrPk = 0.0f, freezeIfPk = 0.0f;
 
@@ -31,6 +40,33 @@ ezBuzzer buzzer(BUZZER_PIN, BUZZER_TYPE_PASSIVE);
 unsigned long lastLcdUpdate = 0;
 unsigned long lastFrozenLcdUpdate = 0;
 const unsigned long lcdInterval = 250; // Update LCD every 250ms
+
+void handleModeButton() {
+  int reading = digitalRead(BTN_PIN);
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    static int buttonState = HIGH;
+    if (reading != buttonState) {
+      buttonState = reading;
+      if (buttonState == LOW) { // Button clicked (pulled to GND)
+        isPlotterMode = !isPlotterMode;
+        tone(BUZZER_PIN, 2500, 60); // Short beep (60ms) to indicate mode change
+
+        if (isPlotterMode) {
+          lcd.setCursor(0, 0);
+          lcd.print(F(" Serial Plotter "));
+          lcd.setCursor(0, 1);
+          lcd.print(F("  Streaming S/R "));
+        } else {
+          lastLcdUpdate = 0; // Trigger immediate LCD update in RMS mode
+        }
+      }
+    }
+  }
+  lastButtonState = reading;
+}
 
 // -------------------------------------------------------------
 // Voltage Sensor Configuration Structure (ZMPT101B)
@@ -180,20 +216,51 @@ void updateLcdNormal(float vsRms, float isRms, float vrRms, float irRms) {
   }
 }
 
-// Frozen fault condition display:
-// Row 0: Vs: 7.09  Vr: 1.03
-// Row 1: Is: 8.29  Ir: 0.00
-void updateLcdFrozenFault(float vs, float vr, float is, float ir) {
+// Frozen fault condition display (matching normal operation order: Vs, Is on Row 0; Vr, Ir on Row 1):
+// Row 0: !S: 7.1V 8.11A !
+// Row 1: !R: 0.9V 0.00A !
+void updateLcdFrozenFault(float vs, float is, float vr, float ir) {
   char vsBuf[7], vrBuf[7], isBuf[7], irBuf[7];
   char line0[17], line1[17];
 
-  dtostrf(vs, 4, (vs >= 10.0f) ? 1 : 2, vsBuf);
-  dtostrf(vr, 4, (vr >= 10.0f) ? 1 : 2, vrBuf);
+  dtostrf(vs, 4, 1, vsBuf);
+  dtostrf(vr, 4, 1, vrBuf);
   dtostrf(is, 4, (is >= 10.0f) ? 1 : 2, isBuf);
   dtostrf(ir, 4, (ir >= 10.0f) ? 1 : 2, irBuf);
 
-  snprintf(line0, sizeof(line0), "Vs:%-4s  Vr:%-4s", vsBuf, vrBuf);
-  snprintf(line1, sizeof(line1), "Is:%-4s  Ir:%-4s", isBuf, irBuf);
+  snprintf(line0, sizeof(line0), "!S:%4sV %4sA !", vsBuf, isBuf);
+  snprintf(line1, sizeof(line1), "!R:%4sV %4sA !", vrBuf, irBuf);
+
+  line0[16] = '\0';
+  line1[16] = '\0';
+
+  lcd.setCursor(0, 0);
+  lcd.print(line0);
+  lcd.setCursor(0, 1);
+  lcd.print(line1);
+
+  if (Wire.getWireTimeoutFlag()) {
+    Wire.clearWireTimeoutFlag();
+    Wire.begin();
+    Wire.setWireTimeout(3000, true);
+    lcd.init();
+    lcd.backlight();
+  }
+}
+
+// Supply disconnection / clearing time display (switched every 5s / 2s during fault):
+// Row 0: Trip:    12.4 ms
+// Row 1: Cycles:   0.62 cy
+void updateLcdTripTime(float timeMs, float cycles) {
+  char msBuf[8];
+  char cycBuf[8];
+  char line0[17], line1[17];
+
+  dtostrf(timeMs, 5, 1, msBuf);
+  dtostrf(cycles, 5, 2, cycBuf);
+
+  snprintf(line0, sizeof(line0), "Trip:   %5s ms", msBuf);
+  snprintf(line1, sizeof(line1), "Cycles: %5s cy", cycBuf);
 
   line0[16] = '\0';
   line1[16] = '\0';
@@ -216,7 +283,28 @@ void updateLcdFrozenFault(float vs, float vr, float is, float ir) {
 // Setup & Loop
 // -------------------------------------------------------------
 void setup() {
+  uint8_t resetReason = MCUSR;
+  MCUSR = 0; // Clear flags for subsequent resets
+
   Serial.begin(115200);
+
+  // Diagnostic: Print the exact hardware cause of the reboot
+  Serial.print(F("\n--- RESET DETECTED (MCUSR: 0x"));
+  Serial.print(resetReason, HEX);
+  Serial.println(F(") ---"));
+  if (resetReason & (1 << BORF)) {
+    Serial.println(F("[DIAGNOSTIC] Cause: BROWN-OUT RESET (BOD) -> 5V rail dipped below threshold!"));
+  }
+  if (resetReason & (1 << EXTRF)) {
+    Serial.println(F("[DIAGNOSTIC] Cause: EXTERNAL RESET -> RST pin pulled low or reset button pressed."));
+  }
+  if (resetReason & (1 << PORF)) {
+    Serial.println(F("[DIAGNOSTIC] Cause: POWER-ON RESET -> Fresh power applied."));
+  }
+  if (resetReason & (1 << WDRF)) {
+    Serial.println(F("[DIAGNOSTIC] Cause: WATCHDOG RESET."));
+  }
+  Serial.println(F("-------------------------------------------------"));
 
   // Initialize I2C with hardware bus timeout to prevent lockup on switching transients/EMI
   Wire.begin();
@@ -226,8 +314,8 @@ void setup() {
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, HIGH); // Normal closed / un-tripped (Active-Low)
 
-  // Initialize Reset Button (optional external button on D4 to GND; onboard RST button also resets)
-  pinMode(RESET_BTN_PIN, INPUT_PULLUP);
+  // Initialize Mode Toggle Button on Pin D4 (tactile pushbutton pulls pin to GND when pressed)
+  pinMode(BTN_PIN, INPUT_PULLUP);
 
   // Initialize LCD display
   lcd.init();
@@ -258,6 +346,8 @@ void setup() {
 }
 
 void loop() {
+  handleModeButton();
+
   // -------------------------------------------------------------
   // 1. If currently in Latched Fault Mode:
   // Hold relay OPEN, hold buzzer active, freeze LCD and Serial!
@@ -271,23 +361,18 @@ void loop() {
     }
     buzzer.loop();
 
-    // Check Reset Button (Pin D4 or onboard RST button)
-    if (digitalRead(RESET_BTN_PIN) == LOW) {
-      delay(50); // Debounce
-      if (digitalRead(RESET_BTN_PIN) == LOW) {
-        isFaultLatched = false;
-        buzzer.stop();
-        digitalWrite(RELAY_PIN, HIGH); // Re-close relay
-        Serial.println(F("\n>>> FAULT CLEARED VIA RESET BUTTON. RESUMING NORMAL OPERATION <<<\n"));
-        lcd.clear();
-      }
-    }
-
-    // Refresh frozen display periodically (every 250ms) to ensure continuous recovery from any EMI transients
+    // 7-second repeat cycle: Display fault parameters for 5s, trip time for 2s
     unsigned long now = millis();
+    unsigned long elapsed = now - faultLatchTime;
+    unsigned long phase = elapsed % 7000; // 0..4999 = parameters (5s), 5000..6999 = trip time (2s)
+
     if (now - lastFrozenLcdUpdate >= 250) {
       lastFrozenLcdUpdate = now;
-      updateLcdFrozenFault(freezeVs, freezeVr, freezeIs, freezeIr);
+      if (phase < 5000) {
+        updateLcdFrozenFault(freezeVs, freezeIs, freezeVr, freezeIr);
+      } else {
+        updateLcdTripTime(tripTimeMs, tripCycles);
+      }
     }
 
     delay(5);
@@ -295,7 +380,23 @@ void loop() {
   }
 
   // -------------------------------------------------------------
-  // 2. Normal Mode: Acquire Sensors
+  // 2. Serial Plotter Mode:
+  // Simultaneous ADC counts of sending end (Vs: A0) and receiving end (Vr: A1) VOLTAGE ONLY.
+  // Notation: S and R for maximum speed.
+  // -------------------------------------------------------------
+  if (isPlotterMode) {
+    int rawS = analogRead(voltageSensors[0].pin);
+    int rawR = analogRead(voltageSensors[1].pin);
+
+    Serial.print(F("S:"));
+    Serial.print(rawS);
+    Serial.print(F(" R:"));
+    Serial.println(rawR);
+    return;
+  }
+
+  // -------------------------------------------------------------
+  // 3. Normal Mode: Acquire Sensors
   // Sample Sending End Current FIRST for minimal detection delay (20ms)
   // -------------------------------------------------------------
   float isRms = currentSensors[0].getRms();
@@ -318,19 +419,41 @@ void loop() {
   // 3. Fault Detection (Sending-End Current >= 6.0A RMS)
   // -------------------------------------------------------------
   if (isRms >= FAULT_CURRENT_THRESHOLD) {
+    uint32_t tFaultDetect = micros();
+
     // 1. Immediately trip protection relay open!
     digitalWrite(RELAY_PIN, LOW); // Active-Low: LOW = Open/Tripped
     isFaultLatched = true;
+    faultLatchTime = millis();
 
     // Immediately sound audible alarm without delay
     buzzer.beep(150, 0);
     buzzer.loop();
 
-    // 2. Save frozen snapshot values at fault condition
+    // 2. Measure Supply Disconnection Time (until Vs collapses to 0)
+    // High-speed polling on Vs (pin A0) to capture exact moment AC collapses into resting baseline noise
+    uint32_t tLastActive = tFaultDetect;
+    uint32_t tMeasureStart = micros();
+    const int vsBaseline = voltageSensors[0].zeroBaseline;
+    while (micros() - tMeasureStart < 100000UL) { // Up to 100ms window (5 full 50Hz cycles)
+      int raw = analogRead(A0);
+      int dev = abs(raw - vsBaseline);
+      if (dev > 10) { // Still active AC voltage (> 0.8V peak)
+        tLastActive = micros();
+      } else if (micros() - tLastActive > 15000UL) {
+        // Confirmed zero: flatlined within resting noise for >15ms (3/4 of a 50Hz period)
+        break;
+      }
+    }
+
+    tripTimeMs = (float)(tLastActive - tFaultDetect) / 1000.0f;
+    tripCycles = tripTimeMs / 20.0f; // 20.0ms per 50Hz cycle
+
+    // 3. Save frozen snapshot values at fault condition
     freezeVs = vsRms;  freezeVr = vrRms;  freezeIs = isRms;  freezeIr = irRms;  freezeIf = ifRms;
     freezeVsPk = vsPeak; freezeVrPk = vrPeak; freezeIsPk = isPeak; freezeIrPk = irPeak; freezeIfPk = ifPeak;
 
-    // 3. Print the EXACT single frozen serial line (Fault:1)
+    // 4. Print the frozen serial line with Fault:1 and clearing time
     Serial.print(F("Vs_RMS:"));  Serial.print(freezeVs, 2);   Serial.print(F(" "));
     Serial.print(F("Vs_Peak:")); Serial.print(freezeVsPk, 2); Serial.print(F(" "));
     Serial.print(F("Vr_RMS:"));  Serial.print(freezeVr, 2);   Serial.print(F(" "));
@@ -341,17 +464,22 @@ void loop() {
     Serial.print(F("Ir_Peak:")); Serial.print(freezeIrPk, 3); Serial.print(F(" "));
     Serial.print(F("If_RMS:"));  Serial.print(freezeIf, 3);   Serial.print(F(" "));
     Serial.print(F("If_Peak:")); Serial.print(freezeIfPk, 3); Serial.print(F(" "));
-    Serial.print(F("Fault:1"));
+    Serial.print(F("Fault:1"));  Serial.print(F(" "));
+    Serial.print(F("Trip_ms:")); Serial.print(tripTimeMs, 1); Serial.print(F(" "));
+    Serial.print(F("Cycles:"));  Serial.print(tripCycles, 2);
     Serial.println();
 
-    // 4. Freeze LCD immediately displaying Vs, Vr, Is, Ir
-    updateLcdFrozenFault(freezeVs, freezeVr, freezeIs, freezeIr);
+    // 5. Freeze LCD immediately displaying Vs, Is, Vr, Ir with fault indicator
+    updateLcdFrozenFault(freezeVs, freezeIs, freezeVr, freezeIr);
     return;
   }
 
   // -------------------------------------------------------------
   // 4. Normal Streaming & LCD Update
   // -------------------------------------------------------------
+  handleModeButton();
+  if (isPlotterMode) return;
+
   Serial.print(F("Vs_RMS:"));  Serial.print(vsRms, 2);  Serial.print(F(" "));
   Serial.print(F("Vs_Peak:")); Serial.print(vsPeak, 2); Serial.print(F(" "));
   Serial.print(F("Vr_RMS:"));  Serial.print(vrRms, 2);  Serial.print(F(" "));
